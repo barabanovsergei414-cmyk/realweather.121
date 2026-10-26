@@ -1,0 +1,220 @@
+name: Build ExtremeWeather (Minecraft 1.21.1 NeoForge)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and package ExtremeWeather
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle (fallback when wrapper is missing)
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Unpack source ZIP and locate Gradle project
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE_ROOT="$RUNNER_TEMP/extremeweather-source"
+          mkdir -p "$SOURCE_ROOT"
+
+          # The repository currently stores the source project as
+          # ExtremeWeather_v0.1_src.zip. Unpack ZIP files from the repository root.
+          while IFS= read -r -d '' archive; do
+            archive_name="$(basename "$archive" .zip)"
+            destination="$SOURCE_ROOT/$archive_name"
+            mkdir -p "$destination"
+            echo "Extracting: $(basename "$archive")"
+            unzip -q "$archive" -d "$destination"
+          done < <(find "$GITHUB_WORKSPACE" -maxdepth 2 -type f -iname '*.zip' \
+                    ! -path "$GITHUB_WORKSPACE/dist/*" -print0)
+
+          # Prefer a project containing the Gradle Wrapper. This avoids relying
+          # on a hard-coded folder such as ./RealWeather, which does not exist here.
+          PROJECT_DIR=""
+          for root in "$SOURCE_ROOT" "$GITHUB_WORKSPACE"; do
+            candidate="$(find "$root" \
+              -type d \( -name .git -o -name .gradle -o -name build \) -prune -o \
+              -type f -name gradlew -print -quit 2>/dev/null || true)"
+            if [[ -n "$candidate" ]]; then
+              PROJECT_DIR="$(dirname "$candidate")"
+              break
+            fi
+          done
+
+          # If the wrapper is missing, find a Gradle root using settings.gradle.
+          if [[ -z "$PROJECT_DIR" ]]; then
+            for root in "$SOURCE_ROOT" "$GITHUB_WORKSPACE"; do
+              candidate="$(find "$root" \
+                -type d \( -name .git -o -name .gradle -o -name build \) -prune -o \
+                -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit 2>/dev/null || true)"
+              if [[ -n "$candidate" ]]; then
+                PROJECT_DIR="$(dirname "$candidate")"
+                break
+              fi
+            done
+          fi
+
+          # Last fallback: a single-module project without settings.gradle.
+          if [[ -z "$PROJECT_DIR" ]]; then
+            for root in "$SOURCE_ROOT" "$GITHUB_WORKSPACE"; do
+              candidate="$(find "$root" \
+                -type d \( -name .git -o -name .gradle -o -name build \) -prune -o \
+                -type f \( -name build.gradle -o -name build.gradle.kts \) -print -quit 2>/dev/null || true)"
+              if [[ -n "$candidate" ]]; then
+                PROJECT_DIR="$(dirname "$candidate")"
+                break
+              fi
+            done
+          fi
+
+          if [[ -z "$PROJECT_DIR" ]]; then
+            echo "::error::No Gradle project found. Check that the source ZIP contains build.gradle or gradlew."
+            echo "Files found in repository:"
+            find "$GITHUB_WORKSPACE" -maxdepth 4 -type f | head -200
+            exit 1
+          fi
+
+          echo "Gradle project root: $PROJECT_DIR"
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Build mod
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          echo "Project directory: $PROJECT_DIR"
+          echo "Java version:"
+          java -version
+
+          # Prefer the project's own wrapper. If the ZIP omitted wrapper files,
+          # use the Gradle 8.10.2 installed by setup-gradle above.
+          if [[ -f ./gradlew && -f ./gradle/wrapper/gradle-wrapper.jar ]]; then
+            chmod +x ./gradlew
+            ./gradlew clean build --no-daemon --stacktrace 2>&1 | tee "$RUNNER_TEMP/ExtremeWeather-build.log"
+          else
+            echo "Gradle Wrapper is missing; using installed Gradle 8.10.2."
+            gradle clean build --no-daemon --stacktrace 2>&1 | tee "$RUNNER_TEMP/ExtremeWeather-build.log"
+          fi
+
+      - name: Package compiled JAR into ZIP
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+
+          DIST="$GITHUB_WORKSPACE/dist"
+          PACKAGE_DIR="$DIST/package"
+          rm -rf "$DIST"
+          mkdir -p "$PACKAGE_DIR"
+
+          mapfile -t JARS < <(find "$PROJECT_DIR" \
+            -type f -path '*/build/libs/*.jar' \
+            ! -name '*-sources.jar' \
+            ! -name '*-javadoc.jar' \
+            ! -name '*-dev.jar' \
+            -print | sort)
+
+          if [[ ${#JARS[@]} -eq 0 ]]; then
+            echo "::error::Gradle completed but no release JAR was found under build/libs/."
+            exit 1
+          fi
+
+          # Prefer an ordinary runtime JAR over optional slim/dev variants.
+          MAIN_JAR="${JARS[0]}"
+          for candidate in "${JARS[@]}"; do
+            candidate_name="$(basename "$candidate")"
+            if [[ "$candidate_name" != *-slim.jar && "$candidate_name" != *-dev.jar ]]; then
+              MAIN_JAR="$candidate"
+              break
+            fi
+          done
+
+          OUTPUT_JAR="$PACKAGE_DIR/ExtremeWeather-1.21.1-NeoForge.jar"
+          cp "$MAIN_JAR" "$OUTPUT_JAR"
+
+          if ! unzip -Z1 "$OUTPUT_JAR" | grep -Eq '^META-INF/(neoforge\.mods\.toml|mods\.toml)$'; then
+            echo "::warning::The JAR does not contain a standard NeoForge/Forge mods.toml path. Verify the project metadata."
+          fi
+
+          SHA256="$(sha256sum "$OUTPUT_JAR" | awk '{print $1}')"
+          cat > "$PACKAGE_DIR/BUILD_INFO.txt" <<EOF
+          Mod package: ExtremeWeather
+          Target Minecraft: 1.21.1
+          Loader: NeoForge
+          Java: 21
+          Git commit: $GITHUB_SHA
+          GitHub Actions run: $GITHUB_RUN_ID
+          Original JAR: $(basename "$MAIN_JAR")
+          SHA-256: $SHA256
+          
+          Install the JAR into the mods folder of a compatible Minecraft 1.21.1 NeoForge instance.
+          EOF
+
+          FINAL_ZIP="$DIST/ExtremeWeather-1.21.1-NeoForge.zip"
+          (cd "$PACKAGE_DIR" && zip -qr "$FINAL_ZIP" .)
+          unzip -t "$FINAL_ZIP"
+
+          # Keep a direct JAR download next to the ZIP as well.
+          cp "$OUTPUT_JAR" "$DIST/ExtremeWeather-1.21.1-NeoForge.jar"
+          echo "Created: $FINAL_ZIP"
+          echo "Created: $DIST/ExtremeWeather-1.21.1-NeoForge.jar"
+          ls -lh "$DIST" "$PACKAGE_DIR"
+
+      - name: Upload ZIP and JAR as workflow artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ExtremeWeather-1.21.1-NeoForge-${{ github.run_number }}
+          path: |
+            dist/ExtremeWeather-1.21.1-NeoForge.zip
+            dist/ExtremeWeather-1.21.1-NeoForge.jar
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log if the workflow fails
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ExtremeWeather-build-log-${{ github.run_number }}
+          path: ${{ runner.temp }}/ExtremeWeather-build.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Publish ZIP and JAR to GitHub Releases
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: extremeweather-build-${{ github.run_number }}-${{ github.run_attempt }}
+          name: ExtremeWeather 1.21.1 NeoForge build ${{ github.run_number }}.${{ github.run_attempt }}
+          body: |
+            Automated ExtremeWeather build for Minecraft 1.21.1 + NeoForge.
+
+            Download the ZIP package or the standalone JAR below.
+          files: |
+            dist/ExtremeWeather-1.21.1-NeoForge.zip
+            dist/ExtremeWeather-1.21.1-NeoForge.jar
